@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>AIS Map</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!-- Leaflet.js (本地离线可用) —— 生产环境可替换为本地资源 -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <style>
+        html,
+        body,
+        #map {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            width: 100%;
+        }
+
+        /* AIS 目标标记样式 */
+        .ais-label {
+            font-size: 11px;
+            font-weight: bold;
+            color: #003366;
+            white-space: nowrap;
+            text-shadow: 1px 1px 0 #fff, -1px -1px 0 #fff;
+        }
+
+        .ais-warning {
+            color: #cc0000;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="map"></div>
+    <script>
+        // ============================================================
+        //  Leaflet 地图初始化
+        // ============================================================
+        var map = L.map('map').setView([30.0, 122.0], 8);
+
+        // OpenStreetMap 底图（可替换为离线瓦片）
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors',
+            maxZoom: 18
+        }).addTo(map);
+
+        // ============================================================
+        //  AIS 目标管理
+        // ============================================================
+        var markers = {};   // MMSI → L.marker
+
+        // 根据 COG 生成 SVG 船形图标（三角形朝向航向）
+        function vesselIcon(cog, warning) {
+            var color = warning ? '#cc0000' : '#0055aa';
+            var svg = [
+                '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="-10 -10 20 20">',
+                '<polygon points="0,-8 5,6 0,3 -5,6" ',
+                'fill="', color, '" stroke="#fff" stroke-width="1" ',
+                'transform="rotate(', cog, ')"/>',
+                '</svg>'
+            ].join('');
+            return L.divIcon({
+                html: svg,
+                iconSize: [20, 20],
+                iconAnchor: [10, 10],
+                className: ''
+            });
+        }
+
+        /**
+         * updateMarkers —— 由 C++ (QWebEnginePage::runJavaScript) 调用
+         * @param {Array} targets  AIS 目标数组，每项包含:
+         *   { mmsi, lat, lon, name, sog, cog, hdg, navstatus }
+         */
+        function updateMarkers(targets) {
+            var activeMmsi = new Set();
+
+            targets.forEach(function (t) {
+                activeMmsi.add(t.mmsi);
+
+                var cog = isFinite(t.cog) ? t.cog : 0;
+                var icon = vesselIcon(cog, false);
+                var popup = [
+                    '<b>', t.name || ('MMSI ' + t.mmsi), '</b><br/>',
+                    'MMSI: ', t.mmsi, '<br/>',
+                    'SOG: ', t.sog.toFixed(1), ' kn<br/>',
+                    'COG: ', t.cog.toFixed(1), '°<br/>',
+                    '位置: ', t.lat.toFixed(5), ', ', t.lon.toFixed(5)
+                ].join('');
+
+                if (markers[t.mmsi]) {
+                    // 移动已有标记
+                    markers[t.mmsi].setLatLng([t.lat, t.lon]);
+                    markers[t.mmsi].setIcon(icon);
+                    markers[t.mmsi].getPopup().setContent(popup);
+                } else {
+                    // 新建标记
+                    markers[t.mmsi] = L.marker([t.lat, t.lon], { icon: icon })
+                        .bindPopup(popup)
+                        .addTo(map);
+                }
+            });
+
+            // 移除不再活跃的目标
+            Object.keys(markers).forEach(function (mmsi) {
+                if (!activeMmsi.has(parseInt(mmsi))) {
+                    map.removeLayer(markers[mmsi]);
+                    delete markers[mmsi];
+                }
+            });
+        }
+
+        // ============================================================
+        //  碰撞告警高亮（由 C++ 调用）
+        //  mmsiList: 需要告警的 MMSI 数组
+        // ============================================================
+        function setWarningTargets(mmsiList) {
+            var warnSet = new Set(mmsiList);
+            Object.keys(markers).forEach(function (mmsi) {
+                var t = markers[mmsi]._aisData;
+                if (!t) return;
+                var cog = isFinite(t.cog) ? t.cog : 0;
+                markers[mmsi].setIcon(vesselIcon(cog, warnSet.has(parseInt(mmsi))));
+            });
+        }
+    </script>
+</body>
+
+</html>
