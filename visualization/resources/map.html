@@ -2,133 +2,612 @@
 <html>
 
 <head>
-    <meta charset="utf-8" />
-    <title>AIS Map</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset="utf-8" />
+  <title>AIS Fishing Boat Monitor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <style>
+    html,
+    body,
+    #map {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      width: 100%;
+    }
 
-    <!-- Leaflet.js (本地离线可用) —— 生产环境可替换为本地资源 -->
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    .ais-tip {
+      font-size: 11px;
+      font-weight: bold;
+      color: #003366;
+      white-space: nowrap;
+      text-shadow: 1px 1px 0 #fff, -1px -1px 0 #fff, -1px 1px 0 #fff, 1px -1px 0 #fff;
+    }
 
-    <style>
-        html,
-        body,
-        #map {
-            margin: 0;
-            padding: 0;
-            height: 100%;
-            width: 100%;
-        }
+    .warn1 {
+      color: #cc7700;
+    }
 
-        /* AIS 目标标记样式 */
-        .ais-label {
-            font-size: 11px;
-            font-weight: bold;
-            color: #003366;
-            white-space: nowrap;
-            text-shadow: 1px 1px 0 #fff, -1px -1px 0 #fff;
-        }
+    .warn2 {
+      color: #dd4400;
+    }
 
-        .ais-warning {
-            color: #cc0000;
-        }
-    </style>
+    .warn3 {
+      color: #cc0000;
+    }
+
+    .danger-label {
+      background: rgba(255, 0, 0, 0.75);
+      color: #fff;
+      font-size: 10px;
+      font-weight: bold;
+      padding: 1px 4px;
+      border-radius: 3px;
+      white-space: nowrap;
+    }
+  </style>
 </head>
 
 <body>
-    <div id="map"></div>
-    <script>
-        // ============================================================
-        //  Leaflet 地图初始化
-        // ============================================================
-        var map = L.map('map').setView([30.0, 122.0], 8);
+  <div id="map"></div>
+  <script>
+    /* ============================================================
+       Leaflet 地图 —— 多底图支持（自动降级）
+       ============================================================ */
+    var map = L.map('map', { preferCanvas: true }).setView([30.0, 122.0], 8);
 
-        // OpenStreetMap 底图（可替换为离线瓦片）
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '© OpenStreetMap contributors',
-            maxZoom: 18
+    // 底图定义
+    var baseLayers = {};
+
+    // 1. Esri 卫星图（优先）
+    var esriSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      attribution: 'Tiles &copy; Esri',
+      maxZoom: 18,
+      subdomains: [''],
+      errorTileUrl: ''  // 加载失败时留空，触发自动切换
+    });
+
+    // 2. OpenStreetMap
+    var osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors',
+      maxZoom: 19
+    });
+
+    // 3. CartoDB 浅色底图
+    var cartoLayer = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png', {
+      attribution: '&copy; CartoDB, &copy; OpenStreetMap',
+      maxZoom: 19
+    });
+
+    // 默认先加卫星图，若加载失败则切换到OSM
+    esriSat.addTo(map);
+    baseLayers['卫星图'] = esriSat;
+    baseLayers['街道图'] = osmLayer;
+    baseLayers['浅色图'] = cartoLayer;
+
+    // 瓦片加载失败监听：卫星图连续失败3次后自动切到街道图
+    var esriFailCount = 0;
+    esriSat.on('tileerror', function() {
+      esriFailCount++;
+      if (esriFailCount >= 3 && map.hasLayer(esriSat)) {
+        map.removeLayer(esriSat);
+        osmLayer.addTo(map);
+        console.log('[Map] Esri satellite failed, switched to OSM');
+      }
+    });
+
+    // 图层切换控件
+    L.control.layers(baseLayers, null, { position: 'topright', collapsed: true }).addTo(map);
+
+    /* ============================================================
+       数据状态
+       ============================================================ */
+    var aisMarkers = {};       // mmsi -> marker
+    var warnSet = {};          // mmsi -> zone(1/2/3)
+    var fishingBoat = null;    // marker
+    var guardRings = [];       // [ring1,ring2,ring3]
+    var aisVectors = {};       // mmsi -> vector line
+    var aisPrevPos = {};       // mmsi -> {lat, lon}
+    var aisTrackHistory = {};  // mmsi -> [[lat,lon], ...] 历史轨迹点
+    var aisTrackLines = {};    // mmsi -> L.polyline 历史轨迹线
+    var aisTrackPoints = {};   // mmsi -> L.layerGroup 历史点图层
+    var spokenWarnState = {};  // mmsi -> { ts, zone, sector }
+    var motionLines = {};      // mmsi -> { relLine, connLine, dangerLabel }
+    var ownPos = null;         // {lat, lon}
+    var speechVoice = null;
+
+    /* ============================================================
+       工具：船形 SVG 图标
+       ============================================================ */
+    function makeVesselIcon(cogDeg, zoneColor, size) {
+      size = size || 20;
+      var col = zoneColor || '#0055aa';
+      var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="' + size + '" height="' + size + '" viewBox="-10 -10 20 20">'
+        + '<polygon points="0,-8 5,6 0,3 -5,6" fill="' + col + '" stroke="#fff" stroke-width="1.2"'
+        + ' transform="rotate(' + cogDeg + ')"/></svg>';
+      return L.divIcon({ html: svg, iconSize: [size, size], iconAnchor: [size / 2, size / 2], className: '' });
+    }
+
+    /* ============================================================
+       工具：渔船专用图标（红色 + 大号）
+       ============================================================ */
+    function makeFishingBoatIcon(hdgDeg) {
+      var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="-14 -14 28 28">'
+        + '<polygon points="0,-10 7,8 0,4 -7,8" fill="#e60026" stroke="#fff" stroke-width="1.5"'
+        + ' transform="rotate(' + hdgDeg + ')"/>'
+        + '<circle r="4" fill="#e60026" stroke="#fff" stroke-width="1"/>'
+        + '</svg>';
+      return L.divIcon({ html: svg, iconSize: [28, 28], iconAnchor: [14, 14], className: '' });
+    }
+
+    /* ============================================================
+       工具：警戒圈颜色
+       ============================================================ */
+    function ringColor(zone) {
+      return zone === 3 ? '#cc0000' : zone === 2 ? '#ff6600' : '#ffcc00';
+    }
+
+    function isValidDeg(v) {
+      return typeof v === 'number' && isFinite(v) && v >= 0 && v <= 360;
+    }
+
+    function normalizeDeg(v) {
+      var x = v % 360;
+      return x < 0 ? x + 360 : x;
+    }
+
+    function computeTrackHeadingDeg(mmsi, lat, lon, fallbackCog) {
+      var prev = aisPrevPos[mmsi];
+      aisPrevPos[mmsi] = { lat: lat, lon: lon };
+
+      if (!prev) {
+        return isValidDeg(fallbackCog) ? normalizeDeg(fallbackCog) : 0;
+      }
+
+      var meanLatRad = ((prev.lat + lat) * 0.5) * Math.PI / 180.0;
+      var dLatM = (lat - prev.lat) * 111320.0;
+      var dLonM = (lon - prev.lon) * 111320.0 * Math.cos(meanLatRad);
+      if (Math.abs(dLatM) < 0.01 && Math.abs(dLonM) < 0.01) {
+        return isValidDeg(fallbackCog) ? normalizeDeg(fallbackCog) : 0;
+      }
+
+      return normalizeDeg(Math.atan2(dLonM, dLatM) * 180.0 / Math.PI);
+    }
+
+    function buildAisVectorEnd(lat, lon, headingDeg, sogKn) {
+      var lineLenM = Math.max(30.0, (sogKn > 0 ? sogKn : 0) * 1852.0 * (6.0 / 60.0));
+      var mPerDegLat = 111320.0;
+      var mPerDegLon = 111320.0 * Math.cos(lat * Math.PI / 180.0);
+      var rad = headingDeg * Math.PI / 180.0;
+      var dLat = (lineLenM * Math.cos(rad)) / mPerDegLat;
+      var dLon = (lineLenM * Math.sin(rad)) / mPerDegLon;
+      return { lat: lat + dLat, lon: lon + dLon };
+    }
+
+    function pickSpeechVoice() {
+      if (!window.speechSynthesis) return null;
+      var voices = window.speechSynthesis.getVoices();
+      if (!voices || !voices.length) return null;
+      for (var i = 0; i < voices.length; i++) {
+        if ((voices[i].lang || '').toLowerCase().indexOf('zh') === 0) {
+          return voices[i];
+        }
+      }
+      return voices[0] || null;
+    }
+
+    function speakWithBrowser(text) {
+      if (!window.speechSynthesis || !text) return false;
+      speechVoice = speechVoice || pickSpeechVoice();
+      var utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = speechVoice ? speechVoice.lang : 'zh-CN';
+      utterance.rate = 1.0;
+      utterance.pitch = 1.0;
+      if (speechVoice) {
+        utterance.voice = speechVoice;
+      }
+      if (window.speechSynthesis.pending) {
+        window.speechSynthesis.cancel();
+      }
+      window.speechSynthesis.speak(utterance);
+      return true;
+    }
+
+    function speakAlertText(text) {
+      if (!text) return;
+      if (_bridge && _bridge.speakAlert) {
+        _bridge.speakAlert(text);
+        return;
+      }
+      speakWithBrowser(text);
+    }
+
+    /* ============================================================
+       updateAisMarkers — 由 C++ 调用
+       ============================================================ */
+    function updateAisMarkers(targets) {
+      var active = {};
+      targets.forEach(function (t) {
+        active[t.mmsi] = true;
+        var warn = warnSet[t.mmsi] || { zone: 0, isDanger: false };
+        var zone = warn.zone || 0;
+        var color = zone === 3 ? '#cc0000' : zone === 2 ? '#ff6600' : zone === 1 ? '#ddaa00' : '#0055aa';
+        var headingDeg = isValidDeg(t.hdg)
+          ? normalizeDeg(t.hdg)
+          : computeTrackHeadingDeg(t.mmsi, t.lat, t.lon, t.cog);
+        var icon = makeVesselIcon(headingDeg, color);
+        var headingSrc = isValidDeg(t.hdg) ? 'HDG' : 'Track';
+        var tip = '<b>' + (t.name || 'MMSI ' + t.mmsi) + '</b><br/>'
+          + 'MMSI: ' + t.mmsi + '<br/>'
+          + 'SOG: ' + t.sog.toFixed(1) + ' kn<br/>'
+          + 'Heading(' + headingSrc + '): ' + headingDeg.toFixed(1) + '&deg;<br/>'
+          + 'COG: ' + t.cog.toFixed(1) + '&deg;<br/>'
+          + 'Pos: ' + t.lat.toFixed(5) + ', ' + t.lon.toFixed(5);
+
+        // ── 历史轨迹 ──
+        if (!aisTrackHistory[t.mmsi]) aisTrackHistory[t.mmsi] = [];
+        var hist = aisTrackHistory[t.mmsi];
+        var lastPt = hist.length > 0 ? hist[hist.length - 1] : null;
+        if (!lastPt || Math.abs(lastPt[0] - t.lat) > 0.00002 || Math.abs(lastPt[1] - t.lon) > 0.00002) {
+          hist.push([t.lat, t.lon]);
+          if (hist.length > 80) hist.shift(); // 最多保留 80 个点
+        }
+        var trackColor = zone === 3 ? '#cc3300' : zone === 2 ? '#dd7700' : '#4477cc';
+        if (aisTrackLines[t.mmsi]) {
+          aisTrackLines[t.mmsi].setLatLngs(hist);
+          aisTrackLines[t.mmsi].setStyle({ color: trackColor });
+        } else {
+          aisTrackLines[t.mmsi] = L.polyline(hist, {
+            color: trackColor, weight: 1.5, opacity: 0.55, dashArray: '3,5'
+          }).addTo(map);
+        }
+
+        if (aisTrackPoints[t.mmsi]) {
+          map.removeLayer(aisTrackPoints[t.mmsi]);
+        }
+        var ptGroup = L.layerGroup();
+        var len = hist.length;
+        for (var i = 0; i < len; i++) {
+          var age = (len <= 1) ? 1.0 : (i / (len - 1));
+          var op = 0.15 + 0.70 * age; // 旧点更淡，新点更亮
+          var rad = 1.5 + 1.5 * age;
+          L.circleMarker(hist[i], {
+            radius: rad,
+            color: trackColor,
+            fillColor: trackColor,
+            fillOpacity: op,
+            opacity: op,
+            weight: 1
+          }).addTo(ptGroup);
+        }
+        ptGroup.addTo(map);
+        aisTrackPoints[t.mmsi] = ptGroup;
+
+        var vecEnd = buildAisVectorEnd(t.lat, t.lon, headingDeg, t.sog || 0);
+        if (aisVectors[t.mmsi]) {
+          aisVectors[t.mmsi].setLatLngs([[t.lat, t.lon], [vecEnd.lat, vecEnd.lon]]);
+          aisVectors[t.mmsi].setStyle({
+            color: color,
+            weight: warn.isDanger ? 3.2 : (zone >= 2 ? 2.2 : 1.6),
+            opacity: warn.isDanger ? 0.95 : 0.85
+          });
+        } else {
+          aisVectors[t.mmsi] = L.polyline([[t.lat, t.lon], [vecEnd.lat, vecEnd.lon]], {
+            color: color,
+            weight: warn.isDanger ? 3.2 : (zone >= 2 ? 2.2 : 1.6),
+            opacity: warn.isDanger ? 0.95 : 0.85
+          }).addTo(map);
+        }
+
+        if (aisMarkers[t.mmsi]) {
+          aisMarkers[t.mmsi].setLatLng([t.lat, t.lon]);
+          aisMarkers[t.mmsi].setIcon(icon);
+          aisMarkers[t.mmsi].getPopup().setContent(tip);
+          aisMarkers[t.mmsi].setOpacity(warn.isDanger ? 1.0 : 0.92);
+          aisMarkers[t.mmsi].setZIndexOffset(warn.isDanger ? 900 : 0);
+          aisMarkers[t.mmsi].options._heading = headingDeg;
+        } else {
+          var mk = L.marker([t.lat, t.lon], { icon: icon })
+            .bindPopup(tip).addTo(map);
+          mk.setOpacity(warn.isDanger ? 1.0 : 0.92);
+          mk.setZIndexOffset(warn.isDanger ? 900 : 0);
+          mk.options._heading = headingDeg;
+          aisMarkers[t.mmsi] = mk;
+        }
+      });
+      Object.keys(aisMarkers).forEach(function (mmsi) {
+        if (!active[parseInt(mmsi)]) {
+          map.removeLayer(aisMarkers[mmsi]);
+          delete aisMarkers[mmsi];
+          delete aisPrevPos[mmsi];
+          delete spokenWarnState[mmsi];
+        }
+      });
+      Object.keys(aisVectors).forEach(function (mmsi) {
+        if (!active[parseInt(mmsi)]) {
+          map.removeLayer(aisVectors[mmsi]);
+          delete aisVectors[mmsi];
+        }
+      });
+      Object.keys(aisTrackLines).forEach(function (mmsi) {
+        if (!active[parseInt(mmsi)]) {
+          map.removeLayer(aisTrackLines[mmsi]);
+          delete aisTrackLines[mmsi];
+          delete aisTrackHistory[mmsi];
+        }
+      });
+      Object.keys(aisTrackPoints).forEach(function (mmsi) {
+        if (!active[parseInt(mmsi)]) {
+          map.removeLayer(aisTrackPoints[mmsi]);
+          delete aisTrackPoints[mmsi];
+        }
+      });
+    }
+
+    /* ============================================================
+       updateFishingBoat — 由 C++ 调用
+       ============================================================ */
+    function updateFishingBoat(lat, lon, hdg, sog) {
+      ownPos = { lat: lat, lon: lon };
+      var icon = makeFishingBoatIcon(hdg);
+      var tip = '<b style="color:#e60026">渔船（本船）</b><br/>'
+        + 'Lat: ' + lat.toFixed(5) + '<br/>'
+        + 'Lon: ' + lon.toFixed(5) + '<br/>'
+        + 'Hdg: ' + hdg.toFixed(1) + '&deg;<br/>'
+        + 'SOG: ' + sog.toFixed(1) + ' kn<br/>'
+        + '<i>双击图标可拖拽修改位置</i>';
+      if (fishingBoat) {
+        fishingBoat.setLatLng([lat, lon]);
+        fishingBoat.setIcon(icon);
+        fishingBoat.getPopup().setContent(tip);
+      } else {
+        fishingBoat = L.marker([lat, lon], { icon: icon, zIndexOffset: 1000 })
+          .bindPopup(tip).addTo(map);
+        map.setView([lat, lon], 13);
+        setupFishingBoatInteraction();
+      }
+    }
+
+    /* ============================================================
+       渔船交互：双击启用拖拽，拖拽结束通知C++
+       ============================================================ */
+    function setupFishingBoatInteraction() {
+      if (!fishingBoat) return;
+
+      // 双击启用拖拽
+      fishingBoat.on('dblclick', function (e) {
+        L.DomEvent.stopPropagation(e);
+        if (!fishingBoat.dragging.enabled()) {
+          fishingBoat.dragging.enable();
+          fishingBoat.openPopup();
+          // 提示用户
+          var tip = fishingBoat.getPopup().getContent();
+          if (tip.indexOf('【拖拽中】') < 0) {
+            fishingBoat.getPopup().setContent(tip + '<br/><b style="color:red">【拖拽中】释放鼠标以确定新位置</b>');
+            fishingBoat.openPopup();
+          }
+        }
+      });
+
+      // 拖拽结束
+      fishingBoat.on('dragend', function (e) {
+        var newLatLng = fishingBoat.getLatLng();
+        fishingBoat.dragging.disable();
+        if (_bridge && _bridge.onBoatMoved) {
+          _bridge.onBoatMoved(newLatLng.lat, newLatLng.lng);
+        }
+        // 恢复提示文字
+        var tip = fishingBoat.getPopup().getContent();
+        tip = tip.replace(/<br\/><b style="color:red">【拖拽中.*?<\/b>/, '');
+        fishingBoat.getPopup().setContent(tip);
+      });
+
+      // 单击关闭popup时不影响拖拽
+      fishingBoat.on('click', function (e) {
+        if (fishingBoat.dragging.enabled()) {
+          L.DomEvent.stopPropagation(e);
+        }
+      });
+    }
+
+    /* ============================================================
+       updateGuardRings — 由 C++ 调用
+       ============================================================ */
+    function updateGuardRings(lat, lon) {
+      guardRings.forEach(function (r) { map.removeLayer(r); });
+      guardRings = [];
+      var radii = [1200, 800, 400];
+      var colors = ['#ffcc00', '#ff6600', '#cc0000'];
+      radii.forEach(function (r, i) {
+        var c = L.circle([lat, lon], {
+          radius: r, color: colors[i], fill: true,
+          fillColor: colors[i], fillOpacity: 0.06, weight: 1.5,
+          dashArray: i === 0 ? '6,4' : i === 1 ? '4,3' : null
+        }).addTo(map);
+        guardRings.push(c);
+      });
+    }
+
+    /* ============================================================
+       updateWarnings — 由 C++ 调用
+       ============================================================ */
+    function updateWarnings(warnList) {
+      warnSet = {};
+      warnList.forEach(function (w) {
+        warnSet[w.mmsi] = {
+          zone: w.zone || 0,
+          isDanger: !!w.isDanger,
+          sector: w.sector || '',
+          distM: typeof w.distM === 'number' ? w.distM : 0,
+          dcpa: typeof w.dcpa === 'number' ? w.dcpa : 0,
+          tcpa: typeof w.tcpa === 'number' ? w.tcpa : -1
+        };
+      });
+      // 刷新已有标记颜色
+      Object.keys(aisMarkers).forEach(function (mmsi) {
+        var info = warnSet[parseInt(mmsi)] || { zone: 0, isDanger: false, sector: '' };
+        var z = info.zone || 0;
+        var col = z === 3 ? '#cc0000' : z === 2 ? '#ff6600' : z === 1 ? '#ddaa00' : '#0055aa';
+        var heading = aisMarkers[mmsi].options._heading || 0;
+        aisMarkers[mmsi].setIcon(makeVesselIcon(heading, col));
+        aisMarkers[mmsi].setOpacity(info.isDanger ? 1.0 : 0.92);
+        aisMarkers[mmsi].setZIndexOffset(info.isDanger ? 900 : 0);
+        if (aisVectors[mmsi]) {
+          aisVectors[mmsi].setStyle({
+            color: col,
+            weight: info.isDanger ? 3.2 : (z >= 2 ? 2.2 : 1.6),
+            opacity: info.isDanger ? 0.95 : 0.85
+          });
+        }
+        if (!info.isDanger) {
+          delete spokenWarnState[mmsi];
+        }
+        maybeSpeakDangerBearing(parseInt(mmsi), info);
+      });
+    }
+
+    function formatDangerAlertText(info) {
+      // 值班口令风格：{方位}，{级别}，T减{tcpa}分[，{dcpa}米]
+      var levelText = info.zone >= 3 ? '三级危险' : '二级预警';
+      var parts = [info.sector, levelText];
+
+      if (typeof info.tcpa === 'number' && isFinite(info.tcpa) && info.tcpa >= 0 && info.tcpa <= 30) {
+        var tcpaText = info.tcpa < 1 ? '不足一' : (info.tcpa < 10 ? info.tcpa.toFixed(1) : Math.round(info.tcpa).toString());
+        parts.push('T减' + tcpaText + '分');
+      }
+
+      // zone3 才播距离，精简 zone2 播报长度
+      if (info.zone >= 3 && typeof info.dcpa === 'number' && isFinite(info.dcpa) && info.dcpa >= 0) {
+        parts.push(Math.round(info.dcpa) + '米');
+      }
+
+      return parts.join('，');
+    }
+
+    function maybeSpeakDangerBearing(mmsi, info) {
+      if (!info || !info.isDanger || !info.sector) return;
+
+      var now = Date.now();
+      var last = spokenWarnState[mmsi] || null;
+      var zoneChanged = !last || info.zone > last.zone;
+      var sectorChanged = !last || info.sector !== last.sector;
+      // zone3 冷却 10s，zone2 冷却 15s
+      var cooldown = (info.zone >= 3) ? 10000 : 15000;
+      var cooldownElapsed = !last || (now - last.ts) >= cooldown;
+      if (!zoneChanged && !sectorChanged && !cooldownElapsed) return;
+
+      var text = formatDangerAlertText(info);
+      speakAlertText(text);
+      spokenWarnState[mmsi] = { ts: now, zone: info.zone || 0, sector: info.sector };
+    }
+
+    /* ============================================================
+       updateMotionLines — 相对运动方位线与位置连线
+       输入格式：
+       {
+         ownLat, ownLon,
+         targets: [ { mmsi, lat, lon, relCog, relSog, isDanger,
+                      dcpa, tcpa, distM, relBearDeg, zone } ]
+       }
+       ============================================================ */
+    function updateMotionLines(data) {
+      if (!data || !data.targets) return;
+      var active = {};
+      var oLat = data.ownLat;
+      var oLon = data.ownLon;
+
+      // 米/度近似（在局部范围内）
+      var mPerDegLat = 111320.0;
+      var mPerDegLon = 111320.0 * Math.cos(oLat * Math.PI / 180.0);
+
+      data.targets.forEach(function (t) {
+        active[t.mmsi] = true;
+        var existing = motionLines[t.mmsi];
+        if (existing) {
+          existing.relLine.remove();
+          existing.connLine.remove();
+          if (existing.dangerLabel) existing.dangerLabel.remove();
+        }
+
+        // 1. 我船-他船连线（虚线）
+        var connColor = t.isDanger ? '#ff0000' : (t.zone > 0 ? '#ff8800' : '#0088ff');
+        var connWeight = t.isDanger ? 2.5 : 1.2;
+        var connDash = t.isDanger ? null : '4,4';
+        var conn = L.polyline([[oLat, oLon], [t.lat, t.lon]], {
+          color: connColor, weight: connWeight, dashArray: connDash, opacity: 0.7
         }).addTo(map);
 
-        // ============================================================
-        //  AIS 目标管理
-        // ============================================================
-        var markers = {};   // MMSI → L.marker
+        // 2. 相对运动方位线（从他船出发，沿relCog方向，6分钟矢量）
+        var lineLenM = Math.max((t.relSog > 0 ? t.relSog : 0) * 1852.0 * (6.0 / 60.0), 120);
+        var relRad = (t.relCog || 0) * Math.PI / 180.0;
+        var dLat = (lineLenM * Math.cos(relRad)) / mPerDegLat;
+        var dLon = (lineLenM * Math.sin(relRad)) / mPerDegLon;
+        var endLat = t.lat + dLat;
+        var endLon = t.lon + dLon;
+        var relColor = t.isDanger ? '#cc0000' : '#0055aa';
+        var relLine = L.polyline([[t.lat, t.lon], [endLat, endLon]], {
+          color: relColor, weight: t.isDanger ? 3 : 1.5, dashArray: '8,4', opacity: 0.8
+        }).addTo(map);
 
-        // 根据 COG 生成 SVG 船形图标（三角形朝向航向）
-        function vesselIcon(cog, warning) {
-            var color = warning ? '#cc0000' : '#0055aa';
-            var svg = [
-                '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="-10 -10 20 20">',
-                '<polygon points="0,-8 5,6 0,3 -5,6" ',
-                'fill="', color, '" stroke="#fff" stroke-width="1" ',
-                'transform="rotate(', cog, ')"/>',
-                '</svg>'
-            ].join('');
-            return L.divIcon({
-                html: svg,
-                iconSize: [20, 20],
-                iconAnchor: [10, 10],
-                className: ''
-            });
+        // 3. 危险标签
+        var label = null;
+        if (t.isDanger) {
+          var labelHtml = '<div class="danger-label">危险 DCPA:' + (t.dcpa || 0).toFixed(0) + 'm</div>';
+          label = L.marker([t.lat, t.lon], {
+            icon: L.divIcon({ html: labelHtml, className: '', iconSize: [80, 14], iconAnchor: [40, -12] })
+          }).addTo(map);
         }
 
-        /**
-         * updateMarkers —— 由 C++ (QWebEnginePage::runJavaScript) 调用
-         * @param {Array} targets  AIS 目标数组，每项包含:
-         *   { mmsi, lat, lon, name, sog, cog, hdg, navstatus }
-         */
-        function updateMarkers(targets) {
-            var activeMmsi = new Set();
+        motionLines[t.mmsi] = { relLine: relLine, connLine: conn, dangerLabel: label };
+      });
 
-            targets.forEach(function (t) {
-                activeMmsi.add(t.mmsi);
-
-                var cog = isFinite(t.cog) ? t.cog : 0;
-                var icon = vesselIcon(cog, false);
-                var popup = [
-                    '<b>', t.name || ('MMSI ' + t.mmsi), '</b><br/>',
-                    'MMSI: ', t.mmsi, '<br/>',
-                    'SOG: ', t.sog.toFixed(1), ' kn<br/>',
-                    'COG: ', t.cog.toFixed(1), '°<br/>',
-                    '位置: ', t.lat.toFixed(5), ', ', t.lon.toFixed(5)
-                ].join('');
-
-                if (markers[t.mmsi]) {
-                    // 移动已有标记
-                    markers[t.mmsi].setLatLng([t.lat, t.lon]);
-                    markers[t.mmsi].setIcon(icon);
-                    markers[t.mmsi].getPopup().setContent(popup);
-                } else {
-                    // 新建标记
-                    markers[t.mmsi] = L.marker([t.lat, t.lon], { icon: icon })
-                        .bindPopup(popup)
-                        .addTo(map);
-                }
-            });
-
-            // 移除不再活跃的目标
-            Object.keys(markers).forEach(function (mmsi) {
-                if (!activeMmsi.has(parseInt(mmsi))) {
-                    map.removeLayer(markers[mmsi]);
-                    delete markers[mmsi];
-                }
-            });
+      // 清理已消失的目标
+      Object.keys(motionLines).forEach(function (mmsi) {
+        if (!active[parseInt(mmsi)]) {
+          var ml = motionLines[mmsi];
+          ml.relLine.remove();
+          ml.connLine.remove();
+          if (ml.dangerLabel) ml.dangerLabel.remove();
+          delete motionLines[mmsi];
         }
+      });
+    }
 
-        // ============================================================
-        //  碰撞告警高亮（由 C++ 调用）
-        //  mmsiList: 需要告警的 MMSI 数组
-        // ============================================================
-        function setWarningTargets(mmsiList) {
-            var warnSet = new Set(mmsiList);
-            Object.keys(markers).forEach(function (mmsi) {
-                var t = markers[mmsi]._aisData;
-                if (!t) return;
-                var cog = isFinite(t.cog) ? t.cog : 0;
-                markers[mmsi].setIcon(vesselIcon(cog, warnSet.has(parseInt(mmsi))));
-            });
-        }
-    </script>
+    /* ============================================================
+       地图点击 → WebChannel → C++
+       ============================================================ */
+    var _bridge = null;
+
+    function initWebChannel() {
+      new QWebChannel(qt.webChannelTransport, function (channel) {
+        _bridge = channel.objects.mapBridge;
+        if (_bridge && _bridge.onMapReady) _bridge.onMapReady();
+      });
+    }
+
+    map.on('click', function (e) {
+      if (_bridge && _bridge.onMapClick) {
+        _bridge.onMapClick(e.latlng.lat, e.latlng.lng);
+      }
+    });
+
+    /* 初始化 WebChannel */
+    if (typeof qt !== 'undefined') {
+      initWebChannel();
+    } else {
+      document.addEventListener('DOMContentLoaded', function () {
+        if (typeof qt !== 'undefined') initWebChannel();
+      });
+    }
+
+    if (window.speechSynthesis && typeof window.speechSynthesis.onvoiceschanged !== 'undefined') {
+      window.speechSynthesis.onvoiceschanged = function () {
+        speechVoice = pickSpeechVoice();
+      };
+    }
+  </script>
 </body>
 
 </html>

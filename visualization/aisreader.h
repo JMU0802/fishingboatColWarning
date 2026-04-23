@@ -1,63 +1,74 @@
 #pragma once
-/**
- * @file  aisreader.h
- * @brief AIS 数据源抽象层
- *
- * 支持两种数据源（通过构造参数选择）：
- *   1. 文件模式（FilePath 非空）：逐行读取 NMEA 文件并模拟实时播放
- *   2. 串口模式（SerialPort 非空）：接收实际 AIS 接收机的 NMEA 数据流
- *
- * 每当目标表更新时，发出 dataUpdated() 信号。
- */
 
-#include <QObject>
-#include <QTimer>
+#include <QDateTime>
 #include <QFile>
-#include <QTextStream>
-#include <QVector>
 #include <QMap>
+#include <QObject>
+#include <QTextStream>
+#include <QTimer>
+#include <QVector>
 
 #include "ais/myaisdecoder.h"
+#include "serialportreader.h"
 
-// Config 放在类外，避免 GCC 11 对内嵌类默认参数的限制
-struct AisReaderConfig {
-    QString filePath;       // 文件回放路径（为空则使用串口）
-    QString serialPort;     // 串口设备，如 "/dev/ttyUSB0"
-    int     baudRate   = 38400;
-    int     updateMs   = 1000;  // 数据刷新周期（毫秒）
+// ============================================================
+//  AIS 记录（含时间戳，用于线性插值）
+// ============================================================
+struct AisRecord {
+    myAISData data;
+    qint64    timestampMs {0};
 };
 
-class AisReader : public QObject
-{
+// ============================================================
+//  配置
+// ============================================================
+struct AisReaderConfig {
+    QString filePath;
+    QString serialPort;
+    int     baudRate  {38400};
+    int     updateMs  {500};
+};
+
+// ============================================================
+//  AisReader
+// ============================================================
+class AisReader : public QObject {
     Q_OBJECT
 
 public:
     using Config = AisReaderConfig;
 
-    explicit AisReader(QObject* parent = nullptr,
-                       Config    cfg   = Config());
+    explicit AisReader(QObject* parent = nullptr, Config cfg = Config());
 
     void start(const Config& cfg);
     void stop();
 
-    const QVector<myAISData>& targets() const { return m_targetList; }
+    const QVector<myAISData>&   targets()            const;
+    QVector<myAISData>          interpolatedTargets(qint64 nowMs = 0) const;
 
 signals:
     void dataUpdated();
+    void errorOccurred(const QString& error);
 
 private slots:
     void onTimer();
+    void onSerialDataReceived(const QString& sentence);
 
 private:
     void processLine(const QString& line);
 
-    Config          m_cfg;
-    QTimer          m_timer;
-    QFile           m_file;
-    QTextStream     m_stream;
-    myAISDecoder    m_decoder;
+    Config                      m_cfg;
+    QTimer                      m_timer;
+    QFile                       m_file;
+    QTextStream                 m_stream;
+    myAISDecoder                m_decoder;
+    SerialPortReader*           m_serialReader{nullptr};
 
-    // MMSI → AIS 数据，key 保持唯一
-    QMap<int, myAISData> m_targetMap;
-    QVector<myAISData>   m_targetList;
+    QMap<int, AisRecord>        m_prev;   // 上一条有效记录
+    QMap<int, AisRecord>        m_curr;   // 最新一条有效记录
+    QVector<myAISData>          m_targetList;
+
+    // 文件模式模拟时钟（1秒/tick，与渔船仿真同步）
+    qint64 m_simClockMs {0};
+    bool   m_simStarted {false};
 };
